@@ -6,10 +6,13 @@ mod codec;
 mod controller;
 mod util;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub use controller::{create_controller, ControllerMessage};
+pub use util::Key;
+
+// #[cfg(test)]
+// mod tests {
+//     #[test]
+//     fn it_works() {
+//         assert_eq!(2 + 2, 4);
+//     }
+// }

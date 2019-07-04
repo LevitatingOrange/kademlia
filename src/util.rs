@@ -1,29 +1,32 @@
-use generic_array::{arr, ArrayLength, GenericArray};
+use generic_array::typenum::{consts::U128, Unsigned};
+use generic_array::ArrayLength;
 use std::intrinsics::ctlz;
 
-use crate::bucket::Bucket;
-use actix::{Addr, Message};
-use rand::{thread_rng, Rng};
+use actix::Message;
 //use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::fmt::{Display, Formatter};
-use std::hash::Hash;
 use std::net::SocketAddr;
-use tiny_keccak::Keccak;
+//use tiny_keccak::Keccak;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 
 #[derive(PartialEq, Eq, Message, Debug, Clone, Serialize, Deserialize, Copy, Hash)]
-pub struct Key(u128);
+pub struct Key(pub u128);
 
 impl Key {
-    pub fn distance(&self, other: &Key) -> usize {
-        floor_nearest_power_of_two(self.0 ^ other.0)
+    pub fn distance(&self, other: &Key) -> u128 {
+        self.0 ^ other.0
+    }
+    pub fn bucket_index(&self, other: &Key) -> usize {
+        floor_nearest_power_of_two(self.distance(other))
     }
 }
 
-pub trait BucketListSize<K: FindNodeCount> =
-    'static + ArrayLength<Addr<Bucket<Self, K>>> + PartialEq + Eq + Clone;
-pub trait FindNodeCount = 'static + ArrayLength<Key> + PartialEq + Eq;
+pub type BucketListSize = U128;
+pub trait FindNodeCount = 'static + ArrayLength<Connection> + PartialEq + Eq + Default + Debug;
+pub trait ConcurrenceCount = 'static + Unsigned + PartialEq + Eq + Default + Debug;
 
 #[derive(PartialEq, Eq, Message, Debug, Clone, Serialize, Deserialize, Copy)]
 #[serde(
@@ -35,15 +38,72 @@ pub struct Connection {
     pub id: Key,
 }
 
+impl Hash for Connection {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        hasher.write_u128(self.id.0);
+    }
+}
+
 impl Connection {
     pub fn new(address: SocketAddr, id: Key) -> Self {
         Connection { address, id }
     }
 }
 
+impl From<OrderedConnection> for Connection {
+    fn from(oc: OrderedConnection) -> Self {
+        Connection::new(oc.address, oc.id)
+    }
+}
+
 impl Display for Connection {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
         write!(f, "Peer {} with id {:?}", self.address, self.id)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OrderedConnection {
+    pub address: SocketAddr,
+    pub id: Key,
+    pub distance: u128,
+    pub visited: bool,
+    pub visiting: bool,
+}
+
+impl PartialEq for OrderedConnection {
+    // TODO FIND ERROR If id equal but not address
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for OrderedConnection {}
+
+impl OrderedConnection {
+    pub fn new(address: SocketAddr, id: Key, distance: u128) -> Self {
+        OrderedConnection {
+            address,
+            id,
+            distance,
+            visited: false,
+            visiting: false,
+        }
+    }
+}
+
+impl PartialOrd for OrderedConnection {
+    fn partial_cmp(&self, other: &OrderedConnection) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedConnection {
+    fn cmp(&self, other: &OrderedConnection) -> Ordering {
+        // Notice that the we flip the ordering on costs.
+        // In case of a tie we compare positions - this step is necessary
+        // to make implementations of `PartialEq` and `Ord` consistent.
+        other.distance.cmp(&self.distance)
     }
 }
 
@@ -89,8 +149,8 @@ pub fn floor_nearest_power_of_two(val: u128) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generic_array::typenum::{U32, U64};
-    use hex::decode;
+    //use generic_array::typenum::{U32, U64};
+    //use hex::decode;
 
     //#[test]
     // fn create_key_256() {

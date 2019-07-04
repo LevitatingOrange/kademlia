@@ -1,12 +1,9 @@
 use crate::util::*;
-use actix::Message;
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
-use generic_array::GenericArray;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::io;
-use std::net::SocketAddr;
 use tokio::codec::{Decoder, Encoder};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -16,11 +13,13 @@ pub enum PeerMessage<K: FindNodeCount> {
     Pong(Key),
     FindNode {
         sender_id: Key,
-        // TODO somehow get Socketaddr from codec
-        sender_addr: SocketAddr,
         id: Key,
     },
-    FoundNodes(Vec<Connection>),
+    FoundNodes {
+        sender_id: Key,
+        id: Key,
+        nodes: Vec<Connection>,
+    },
     // TODO: check if both needed
     Phantom(std::marker::PhantomData<K>),
     // FindNode(Key<N>),
@@ -29,7 +28,7 @@ pub enum PeerMessage<K: FindNodeCount> {
     //LinearSearchResponse(LinearSearchResponse<N>),
     //Disconnect,
 }
-
+#[derive(Default)]
 pub struct PeerCodec<K: FindNodeCount> {
     p2: std::marker::PhantomData<K>,
 }
