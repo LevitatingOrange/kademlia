@@ -1,10 +1,14 @@
-use generic_array::typenum::{consts::U128, Unsigned};
+use generic_array::typenum::{
+    consts::{U128, U32},
+    Unsigned,
+};
 use generic_array::ArrayLength;
 use std::intrinsics::ctlz;
 
 use actix::Message;
 //use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fmt::Debug;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
@@ -13,18 +17,24 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 #[derive(PartialEq, Eq, Message, Debug, Clone, Serialize, Deserialize, Copy, Hash)]
-pub struct Key(pub u128);
+pub struct KademliaKey(pub u32);
 
-impl Key {
-    pub fn distance(&self, other: &Key) -> u128 {
-        self.0 ^ other.0
+impl KademliaKey {
+    pub fn distance(&self, other: &KademliaKey) -> u128 {
+        (self.0 ^ other.0) as u128
     }
-    pub fn bucket_index(&self, other: &Key) -> usize {
+    pub fn bucket_index(&self, other: &KademliaKey) -> usize {
         floor_nearest_power_of_two(self.distance(other))
     }
 }
 
-pub type BucketListSize = U128;
+impl Display for KademliaKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub type BucketListSize = U32;
 pub trait FindNodeCount = 'static + ArrayLength<Connection> + PartialEq + Eq + Default + Debug;
 pub trait ConcurrenceCount = 'static + Unsigned + PartialEq + Eq + Default + Debug;
 
@@ -35,17 +45,17 @@ pub trait ConcurrenceCount = 'static + Unsigned + PartialEq + Eq + Default + Deb
 )]
 pub struct Connection {
     pub address: SocketAddr,
-    pub id: Key,
+    pub id: KademliaKey,
 }
 
 impl Hash for Connection {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
-        hasher.write_u128(self.id.0);
+        hasher.write_u128(self.id.0 as u128);
     }
 }
 
 impl Connection {
-    pub fn new(address: SocketAddr, id: Key) -> Self {
+    pub fn new(address: SocketAddr, id: KademliaKey) -> Self {
         Connection { address, id }
     }
 }
@@ -65,7 +75,7 @@ impl Display for Connection {
 #[derive(Clone, Copy, Debug)]
 pub struct OrderedConnection {
     pub address: SocketAddr,
-    pub id: Key,
+    pub id: KademliaKey,
     pub distance: u128,
     pub visited: bool,
     pub visiting: bool,
@@ -81,7 +91,7 @@ impl PartialEq for OrderedConnection {
 impl Eq for OrderedConnection {}
 
 impl OrderedConnection {
-    pub fn new(address: SocketAddr, id: Key, distance: u128) -> Self {
+    pub fn new(address: SocketAddr, id: KademliaKey, distance: u128) -> Self {
         OrderedConnection {
             address,
             id,
@@ -107,9 +117,9 @@ impl Ord for OrderedConnection {
     }
 }
 
-// pub fn xor_metric<N: KeyLength>(key1: &Key<N>, key2: &Key<N>) -> u128 {
+// pub fn xor_metric<N: KademliaKeyLength>(KademliaKey1: &KademliaKey<N>, KademliaKey2: &KademliaKey<N>) -> u128 {
 //     let mut result = 0;
-//     for (i, (k1, k2)) in key1.iter().zip(key2).enumerate() {
+//     for (i, (k1, k2)) in KademliaKey1.iter().zip(KademliaKey2).enumerate() {
 //         result = result | (((k1 ^ k2) as u128) << (i * 8));
 //     }
 //     result
@@ -124,26 +134,26 @@ pub fn floor_nearest_power_of_two(val: u128) -> usize {
     }
 }
 
-// pub fn create_key<N: Key, D: Into<Vec<u8>>>(data: Vec<D>) -> GenericArray<u8, N> {
+// pub fn create_KademliaKey<N: KademliaKey, D: Into<Vec<u8>>>(data: Vec<D>) -> GenericArray<u8, N> {
 //     // TODO: shake128 or shake256?
 //     let mut hasher = Keccak::new_shake128();
 //     for d in data {
 //         hasher.update(&(d.into()));
 //     }
-//     let mut key = GenericArray::default();
-//     hasher.finalize(&mut key);
-//     key
+//     let mut KademliaKey = GenericArray::default();
+//     hasher.finalize(&mut KademliaKey);
+//     KademliaKey
 // }
 
-// pub fn create_node_id<N: Key>() -> GenericArray<u8, N> {
+// pub fn create_node_id<N: KademliaKey>() -> GenericArray<u8, N> {
 //     // TODO: shake128 or shake256?
-//     let mut key: GenericArray<u8, N> = GenericArray::default();
+//     let mut KademliaKey: GenericArray<u8, N> = GenericArray::default();
 //     let mut rng = thread_rng();
-//     for k in key.as_mut_slice() {
+//     for k in KademliaKey.as_mut_slice() {
 //         // TODO which distribution does rng.gen use? conflicting results
 //         *k = rng.gen();
 //     }
-//     key
+//     KademliaKey
 // }
 
 #[cfg(test)]
@@ -153,17 +163,17 @@ mod tests {
     //use hex::decode;
 
     //#[test]
-    // fn create_key_256() {
-    //     let key1: GenericArray<u8, U32> = create_key(vec!["192.168.178.192"]);
+    // fn create_KademliaKey_256() {
+    //     let KademliaKey1: GenericArray<u8, U32> = create_KademliaKey(vec!["192.168.178.192"]);
     //     assert_eq!(
-    //         key1.as_slice(),
+    //         KademliaKey1.as_slice(),
     //         decode("d3378e05ca4f003afe70404148ba4741cd8f77e0c1d5a4800af19c801d5328aa")
     //             .unwrap()
     //             .as_slice()
     //     );
-    //     let key2: GenericArray<u8, U32> = create_key(vec!["foo", "bar", "baz"]);
+    //     let KademliaKey2: GenericArray<u8, U32> = create_KademliaKey(vec!["foo", "bar", "baz"]);
     //     assert_eq!(
-    //         key2.as_slice(),
+    //         KademliaKey2.as_slice(),
     //         decode("02cee818616be2012ed040818eb62b13d5fa77e6a778c4effcd0f12c5ffd1fba")
     //             .unwrap()
     //             .as_slice()
@@ -172,10 +182,10 @@ mod tests {
     // #[test]
     // fn create_node_id_256() {
     //     let zero: GenericArray<u8, U32> = GenericArray::default();
-    //     let key1: GenericArray<u8, U32> = create_node_id();
-    //     assert!(key1.as_slice() != zero.as_slice());
-    //     let key2: GenericArray<u8, U32> = create_node_id();
-    //     assert!(key1.as_slice() != key2.as_slice());
+    //     let KademliaKey1: GenericArray<u8, U32> = create_node_id();
+    //     assert!(KademliaKey1.as_slice() != zero.as_slice());
+    //     let KademliaKey2: GenericArray<u8, U32> = create_node_id();
+    //     assert!(KademliaKey1.as_slice() != KademliaKey2.as_slice());
     // }
 
     #[test]
@@ -206,10 +216,10 @@ mod tests {
         }
     }
     // #[test]
-    // fn create_key_064() {
-    //     // let key1: GenericArray<u8, U64> = create_key(vec!["192.168.178.192"]);
-    //     // assert_eq!(key1.as_slice(), decode("9f3a90200b7332050786ccba02316d7d1f3c198db99d7ccbe56328e2ff3e956d2a09a1199cf3aba4f973fad93910dd8a5b479c05ba4bb526b57f1692a7e58da6").unwrap().as_slice());
-    //     let key2: GenericArray<u8, U64> = create_key(vec!["foo","bar","baz"]);
-    //     assert_eq!(key2.as_slice(), decode("7ed3ea82b7b49cdf484e178ea4f33647e6ca3b3a268cddd3f0781e1537af0f6862a0463180ee07495fbe16fa3c75cd0dba25598878639f406ea85e4cd01af5c5").unwrap().as_slice());
+    // fn create_KademliaKey_064() {
+    //     // let KademliaKey1: GenericArray<u8, U64> = create_KademliaKey(vec!["192.168.178.192"]);
+    //     // assert_eq!(KademliaKey1.as_slice(), decode("9f3a90200b7332050786ccba02316d7d1f3c198db99d7ccbe56328e2ff3e956d2a09a1199cf3aba4f973fad93910dd8a5b479c05ba4bb526b57f1692a7e58da6").unwrap().as_slice());
+    //     let KademliaKey2: GenericArray<u8, U64> = create_KademliaKey(vec!["foo","bar","baz"]);
+    //     assert_eq!(KademliaKey2.as_slice(), decode("7ed3ea82b7b49cdf484e178ea4f33647e6ca3b3a268cddd3f0781e1537af0f6862a0463180ee07495fbe16fa3c75cd0dba25598878639f406ea85e4cd01af5c5").unwrap().as_slice());
     // }
 }

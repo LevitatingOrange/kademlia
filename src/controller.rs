@@ -1,9 +1,10 @@
 use crate::bucket::Bucket;
 use crate::codec::PeerCodec;
+use crate::storage::*;
 use crate::util::*;
 use actix::prelude::*;
 use generic_array::GenericArray;
-use log::error;
+use log::{error, info};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::iter::FromIterator;
@@ -12,9 +13,12 @@ use std::time::Duration;
 use tokio::net::{UdpFramed, UdpSocket};
 use tokio::prelude::Stream;
 
+//pub trait MainActor = 'static + Actor<Context: ToEnvelope<Self, ControllerMessage>> + Handler<ControllerMessage>;
+
 #[derive(Debug, Message)]
-pub enum ControllerMessage {
-    FindKNearest(Key),
+pub enum ControllerMessage<S: StorageActor> {
+    StoreKey(KademliaKey, S::StorageData),
+    Retrieve(KademliaKey),
 }
 
 // pub enum GeneratorMessage {
@@ -24,11 +28,14 @@ pub enum ControllerMessage {
 // }
 
 #[derive(Debug, Message)]
-pub enum ControlMessage {
+pub enum ControlMessage<S: StorageActor> {
     AddPeer(Connection),
-    FindNode(Connection, Key),
-    FoundNodes(Connection, Key, Vec<Connection>),
-    ReturnNodes(Connection, Key, Vec<Connection>),
+    FindNode(Connection, KademliaKey, bool),
+    FoundNodes(Connection, KademliaKey, Vec<Connection>),
+    FoundKey(Connection, KademliaKey, S::StorageData),
+    ReturnNodes(Connection, KademliaKey, Vec<Connection>),
+    StoreKey(Connection, KademliaKey, S::StorageData),
+    //HasKey(Connection, KademliaKey, bool),
     Shutdown,
 }
 
@@ -37,18 +44,21 @@ pub enum InformationMessage {
     ChangedBucket(usize, Vec<Connection>),
 }
 
-pub fn create_controller<K, C>(
-    id: Key,
-    first_peer_id: Key,
+pub fn create_controller<K, C, S>(
+    id: KademliaKey,
+    first_peer_id: KademliaKey,
     base_addr: SocketAddr,
     first_peer_addr: SocketAddr,
     bucket_size: usize,
     ping_timeout: Duration,
     find_timeout: Duration,
-) -> Addr<Controller<K, C>>
+    storage_address: Addr<S>,
+) -> Addr<Controller<K, C, S>>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
+    S: StorageActor,
+    //D: Handler<KademliaKeyMessage, Result=KademliaKey>,
 {
     Controller::create(move |_| {
         Controller::new(
@@ -58,35 +68,42 @@ where
             bucket_size,
             ping_timeout,
             find_timeout,
+            storage_address,
         )
     })
 }
 
-pub struct Controller<K: FindNodeCount, C: ConcurrenceCount> {
-    id: Key,
-    bucket_addresses: Option<GenericArray<Addr<Bucket<K, C>>, BucketListSize>>,
+pub struct Controller<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> {
+    id: KademliaKey,
+    bucket_addresses: Option<GenericArray<Addr<Bucket<K, C, S>>, BucketListSize>>,
     buckets: GenericArray<Vec<Connection>, BucketListSize>,
     base_addr: SocketAddr,
     first_peer: Connection,
     bucket_size: usize,
     ping_timeout: Duration,
     find_timeout: Duration,
-    find_timeout_handles: HashMap<Key, SpawnHandle>,
+    find_timeout_handles: HashMap<KademliaKey, SpawnHandle>,
     find_list: Vec<OrderedConnection>,
+    storage_address: Addr<S>,
+    k_nearest_callback: Option<Box<dyn FnOnce(&mut Self, &mut Context<Self>)>>,
+    find_data: bool,
+    find_active: bool,
 }
 
-impl<K, C> Controller<K, C>
+impl<K, C, S> Controller<K, C, S>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
+    S: StorageActor,
 {
     fn new(
-        id: Key,
+        id: KademliaKey,
         base_addr: SocketAddr,
         mut first_peer: Connection,
         bucket_size: usize,
         ping_timeout: Duration,
         find_timeout: Duration,
+        storage_address: Addr<S>,
     ) -> Self {
         let new_port = first_peer.address.port() + id.bucket_index(&first_peer.id) as u16;
         first_peer.address.set_port(new_port);
@@ -103,6 +120,10 @@ where
             find_timeout,
             find_timeout_handles: HashMap::new(),
             find_list: Vec::with_capacity(K::to_usize()),
+            storage_address,
+            k_nearest_callback: None,
+            find_data: false,
+            find_active: false,
         }
     }
 
@@ -110,7 +131,7 @@ where
         OrderedConnection::new(conn.address, conn.id, self.id.distance(&conn.id))
     }
 
-    fn find_k_nearest_locally(&self, id: Key) -> Vec<OrderedConnection> {
+    fn find_k_nearest_locally(&self, id: KademliaKey) -> Vec<OrderedConnection> {
         let conn_map = move |c: &Connection| self.to_ord(c);
 
         let original_bucket = self.id.bucket_index(&id);
@@ -146,32 +167,35 @@ where
     fn find_k_nearest_of_neighbour(
         &mut self,
         ctx: &mut Context<Self>,
-        id: Key,
+        id: KademliaKey,
         neighbour: OrderedConnection,
     ) {
         let conv_neighbour = Connection::from(neighbour);
-        self.send_message(conv_neighbour, ControlMessage::FindNode(conv_neighbour, id));
+        self.send_message(
+            conv_neighbour,
+            ControlMessage::FindNode(conv_neighbour, id, self.find_data),
+        );
         self.find_timeout_handles.insert(
             neighbour.id,
             ctx.run_later(self.find_timeout, move |act: &mut Self, mut inner_ctx| {
+                //println!("TEST2");
                 if let Ok(i) = act.find_list.binary_search(&neighbour) {
                     act.find_list.remove(i);
                 }
-                act.send_find_to_next(&mut inner_ctx, id);
-                // TODO: SEND new
                 act.find_timeout_handles.remove(&neighbour.id);
+                act.send_find_to_next(&mut inner_ctx, id);
             }),
         );
     }
 
-    fn send_message(&self, conn: Connection, message: ControlMessage) {
+    fn send_message(&self, conn: Connection, message: ControlMessage<S>) {
         let index = self.id.bucket_index(&conn.id);
         if let Err(err) = self.bucket_addresses.as_ref().unwrap()[index].try_send(message) {
             error!("Bucket {} responded with error: {}", index, err);
         }
     }
 
-    fn send_find_to_next(&mut self, ctx: &mut Context<Self>, id: Key) {
+    fn send_find_to_next(&mut self, ctx: &mut Context<Self>, id: KademliaKey) {
         // find next best element in our sorted list
         if let Some((i, _)) = self
             .find_list
@@ -184,27 +208,90 @@ where
             self.find_k_nearest_of_neighbour(ctx, id, self.find_list[i]);
         } else {
             if self.find_list.iter().all(|c| !c.visiting) {
-                println!("Search done: {:?}", self.find_list);
+                if let Some(f) = self.k_nearest_callback.take() {
+                    f(self, ctx);
+                }
+                self.k_nearest_callback = None;
+                self.find_active = false;
                 self.find_list.truncate(0);
-                // we are done!
+                self.find_timeout_handles.clear();
+                if self.find_data {
+                    println!("No data found for key \"{}\"", id);
+                // TODO send no key found here
+                } else {
+                    info!("Search done: {:?}", self.find_list);
+                }
             }
         }
     }
 
-    fn find_k_nearest_globally(&mut self, id: Key) {
+    fn find_nodes(&mut self, id: KademliaKey) {
+        self.find_data = false;
+        self.find_k_nearest_globally(id);
+    }
+
+    fn find_data(&mut self, id: KademliaKey) {
+        self.find_data = true;
+        self.find_k_nearest_globally(id);
+    }
+
+    fn find_k_nearest_globally(&mut self, id: KademliaKey) {
+        self.find_active = true;
         let nodes = self.find_k_nearest_locally(id);
         self.find_list = nodes;
         for d in self.find_list.iter().take(C::to_usize()) {
             let conn = Connection::from(*d);
-            self.send_message(conn, ControlMessage::FindNode(conn, id));
+            self.send_message(conn, ControlMessage::FindNode(conn, id, false));
         }
+    }
+
+    fn reorder_find_list(
+        &mut self,
+        ctx: &mut Context<Self>,
+        conn: Connection,
+        nodes: Vec<Connection>,
+    ) {
+        if let Some(handle) = self.find_timeout_handles.remove(&conn.id) {
+            info!("Cancelling handle for conn {:?}", conn);
+            ctx.cancel_future(handle);
+        }
+        if let Ok(i) = self.find_list.binary_search(&self.to_ord(&conn)) {
+            self.find_list[i].visited = true;
+            self.find_list[i].visiting = false;
+        } else {
+            error!("Could not find sending node in find list. This is a bug!");
+        }
+
+        // put new found nodes in our list and correct their ports (each port corresponds to a bucket)
+        for new_node in nodes {
+            let mut new_node = self.to_ord(&new_node);
+            // insert in correct place
+            if let Err(i) = self.find_list.binary_search(&new_node) {
+                // Crucial bit: we recompute the port by subtracting the
+                // bucket index in the sending node to get the baseport
+                // of `new_node` and adding the bucket index here. This
+                // is because each bucket only inserts nodes to it's own
+                // socket because this makes bookkepping way easier.
+
+                // TODO: not sure if correct here. The used bucket seems
+                // wrong? Investigate
+                let new_port = new_node.address.port()
+                    - (conn.id.bucket_index(&new_node.id) as u16)
+                    + (self.id.bucket_index(&new_node.id) as u16);
+                new_node.address.set_port(new_port);
+                self.find_list.insert(i, new_node);
+            }
+        }
+        // remove nodes that are too far away
+        self.find_list.truncate(K::to_usize());
     }
 }
 
-impl<K, C> Actor for Controller<K, C>
+impl<K, C, S> Actor for Controller<K, C, S>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
+    S: StorageActor,
 {
     type Context = actix::Context<Self>;
 
@@ -218,10 +305,11 @@ where
                     let id = self.id.clone();
                     let bucket_size = self.bucket_size.clone();
                     let ping_timeout = self.ping_timeout.clone();
+                    let storage_addr = self.storage_address.clone();
                     Bucket::create(move |inner_ctx| {
                         let (w, r) = UdpFramed::new(socket, PeerCodec::default()).split();
                         Bucket::add_stream(r, inner_ctx);
-                        Bucket::new(i, id, addr, bucket_size, ping_timeout, w)
+                        Bucket::new(i, id, addr, bucket_size, ping_timeout, w, storage_addr)
                     })
                 }
                 Err(err) => {
@@ -235,7 +323,7 @@ where
 
         // do it later so buckets get the first peer
         ctx.run_later(Duration::from_millis(500), move |act: &mut Self, _| {
-            act.find_k_nearest_globally(act.id);
+            act.find_nodes(act.id);
         });
     }
 
@@ -249,13 +337,15 @@ where
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControlMessage> for Controller<K, C> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMessage<S>>
+    for Controller<K, C, S>
+{
     type Result = ();
 
-    fn handle(&mut self, msg: ControlMessage, ctx: &mut Self::Context) {
-        println!("Controller got message: {:?}", msg);
+    fn handle(&mut self, msg: ControlMessage<S>, ctx: &mut Self::Context) {
+        info!("Controller got message: {:?}", msg);
         match msg {
-            ControlMessage::FindNode(peer, other_id) => {
+            ControlMessage::FindNode(peer, other_id, _) => {
                 // TODO handle too few nodes in bucket
                 // // Send message with request for their nodes
                 // // recompute port by using -d and adding new bucket_index
@@ -276,46 +366,30 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControlMessage> for Controll
                 );
             }
             ControlMessage::FoundNodes(conn, id, nodes) => {
-                if let Some(handle) = self.find_timeout_handles.remove(&conn.id) {
-                    ctx.cancel_future(handle);
+                if !self.find_active {
+                    return;
                 }
-                if let Ok(i) = self.find_list.binary_search(&self.to_ord(&conn)) {
-                    self.find_list[i].visited = true;
-                    self.find_list[i].visiting = false;
-                } else {
-                    error!("Could not find sending node in find list. This is a bug!");
-                }
-
-                // put new found nodes in our list and correct their ports (each port corresponds to a bucket)
-                for new_node in nodes {
-                    let mut new_node = self.to_ord(&new_node);
-                    // insert in correct place
-                    if let Err(i) = self.find_list.binary_search(&new_node) {
-                        // Crucial bit: we recompute the port by subtracting the
-                        // bucket index in the sending node to get the baseport
-                        // of `new_node` and adding the bucket index here. This
-                        // is because each bucket only inserts nodes to it's own
-                        // socket because this makes bookkepping way easier.
-
-                        // TODO: not sure if correct here. The used bucket seems
-                        // wrong? Investigate
-                        let new_port = new_node.address.port()
-                            - (conn.id.bucket_index(&new_node.id) as u16)
-                            + (self.id.bucket_index(&new_node.id) as u16);
-                        println!(
-                            "Prev: {}, Base: {}, New: {}",
-                            new_node.address.port(),
-                            new_node.address.port() - (conn.id.bucket_index(&new_node.id) as u16),
-                            new_port
-                        );
-                        new_node.address.set_port(new_port);
-                        self.find_list.insert(i, new_node);
-                    }
-                }
-                // remove nodes that are too far away
-                self.find_list.truncate(K::to_usize());
-
+                self.reorder_find_list(ctx, conn, nodes);
                 self.send_find_to_next(ctx, id);
+
+                // TODO: here we have to recompute the id's (do it before the
+                // end) TODO: Does it make send that we do "got_contact" in
+                // /find_node/found_node in bucket? It is not necessarily the
+                // node we want in the buckets? Yes? because we expand our system that way
+            }
+            ControlMessage::FoundKey(conn, id, data) => {
+                if !self.find_active {
+                    return;
+                }
+                self.find_timeout_handles.clear();
+                self.find_active = false;
+                self.find_list.truncate(0);
+                println!(
+                    "Got data with id \"{}\" from peer (\"{}\"): \"{:?}\"",
+                    id, conn, data
+                );
+                //self.reorder_find_list(ctx, conn, nodes);
+                //self.send_find_to_next(ctx, id);
 
                 // TODO: here we have to recompute the id's (do it before the
                 // end) TODO: Does it make send that we do "got_contact" in
@@ -327,11 +401,13 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControlMessage> for Controll
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount> Handler<InformationMessage> for Controller<K, C> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<InformationMessage>
+    for Controller<K, C, S>
+{
     type Result = ();
 
     fn handle(&mut self, msg: InformationMessage, _: &mut Self::Context) {
-        println!("Controller got message: {:?}", msg);
+        info!("Controller got message: {:?}", msg);
         match msg {
             InformationMessage::ChangedBucket(i, bucket) => {
                 self.buckets[i] = bucket;
@@ -340,14 +416,28 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Handler<InformationMessage> for Cont
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControllerMessage> for Controller<K, C> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControllerMessage<S>>
+    for Controller<K, C, S>
+{
     type Result = ();
-    fn handle(&mut self, msg: ControllerMessage, _: &mut Self::Context) {
-        println!("Controller got controller message: {:?}", msg);
+    fn handle(&mut self, msg: ControllerMessage<S>, _: &mut Self::Context) {
+        info!("Controller got controller message: {:?}", msg);
         match msg {
-            ControllerMessage::FindKNearest(id) => {
-                self.find_k_nearest_globally(id);
+            ControllerMessage::StoreKey(id, data) => {
+                self.k_nearest_callback = Some(Box::new(move |act, _| {
+                    info!("Sending Store Request for key \"{}\" to found peers...", id);
+                    for conn in &act.find_list {
+                        let c = Connection::from(conn.clone());
+                        act.send_message(c, ControlMessage::StoreKey(c, id, data.clone()));
+                    }
+                }));
+                self.find_nodes(id);
             }
+            ControllerMessage::Retrieve(id) => {
+                self.find_data(id);
+            } // m => {
+              //     error!("Unrecognized controller message: {:?}", m);
+              // }
         }
     }
 }

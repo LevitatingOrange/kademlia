@@ -29,3 +29,8 @@ log = "0.4"
 rand = "0.6"
 futures-preview = {version = "0.3.0-alpha.17", features=["async-await", "nightly"]}
 env_logger = "0.6"
+
+# Remove when binary is put outside of this project
+dialoguer = "0.4"
+tokio-signal = "0.2"
+console = "0.7"

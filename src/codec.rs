@@ -1,3 +1,4 @@
+use crate::storage::*;
 use crate::util::*;
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
@@ -8,36 +9,67 @@ use tokio::codec::{Decoder, Encoder};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "cmd", content = "data", bound = "K: FindNodeCount")]
-pub enum PeerMessage<K: FindNodeCount> {
+pub enum PeerMessage<K: FindNodeCount, S: StorageActor> {
     Ping,
-    Pong(Key),
+    Pong(KademliaKey),
     FindNode {
-        sender_id: Key,
-        id: Key,
+        sender_id: KademliaKey,
+        id: KademliaKey,
+        find_data: bool,
     },
     FoundNodes {
-        sender_id: Key,
-        id: Key,
+        sender_id: KademliaKey,
+        id: KademliaKey,
         nodes: Vec<Connection>,
     },
+    FoundKey {
+        sender_id: KademliaKey,
+        id: KademliaKey,
+        data: S::StorageData,
+    },
+    StoreKey {
+        sender_id: KademliaKey,
+        key: KademliaKey,
+        data: S::StorageData,
+    },
+    // StoreKeyAnswer {
+    //     sender_id: KademliaKey,
+    //     key:KademliaKey,
+    //     answer: Result<SocketAddr, StorageError>
+    // },
     // TODO: check if both needed
-    Phantom(std::marker::PhantomData<K>),
+    Phantom(std::marker::PhantomData<K>, std::marker::PhantomData<S>),
     // FindNode(Key<N>),
     // FoundNodes(GenericArray<Key<N>, K>),
     //LinearSearchRequest(LinearSearchRequest<N>),
     //LinearSearchResponse(LinearSearchResponse<N>),
     //Disconnect,
 }
-#[derive(Default)]
-pub struct PeerCodec<K: FindNodeCount> {
-    p2: std::marker::PhantomData<K>,
+//#[derive(Default)]
+pub struct PeerCodec<K: FindNodeCount, S: StorageActor> {
+    p1: std::marker::PhantomData<K>,
+    p2: std::marker::PhantomData<S>,
 }
 
-impl<K> Decoder for PeerCodec<K>
+impl<K, S> Default for PeerCodec<K, S>
 where
     K: FindNodeCount,
+    S: StorageActor,
 {
-    type Item = PeerMessage<K>;
+    fn default() -> Self {
+        Self {
+            p1: std::marker::PhantomData::default(),
+            p2: std::marker::PhantomData::default(),
+        }
+    }
+}
+
+impl<K, S> Decoder for PeerCodec<K, S>
+where
+    K: FindNodeCount,
+    S: StorageActor,
+{
+    type Item = PeerMessage<K, S>;
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -51,21 +83,22 @@ where
         if src.len() >= size + 2 {
             src.split_to(2);
             let buf = src.split_to(size);
-            Ok(Some(serde_json::from_slice::<PeerMessage<K>>(&buf)?))
+            Ok(Some(serde_json::from_slice::<PeerMessage<K, S>>(&buf)?))
         } else {
             Ok(None)
         }
     }
 }
 
-impl<K> Encoder for PeerCodec<K>
+impl<K, S> Encoder for PeerCodec<K, S>
 where
     K: FindNodeCount,
+    S: StorageActor,
 {
-    type Item = PeerMessage<K>;
+    type Item = PeerMessage<K, S>;
     type Error = io::Error;
 
-    fn encode(&mut self, msg: PeerMessage<K>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, msg: PeerMessage<K, S>, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let msg = serde_json::to_string(&msg).unwrap();
         let msg_ref: &[u8] = msg.as_ref();
 

@@ -3,7 +3,7 @@ use crate::controller::Controller;
 use crate::controller::{ControlMessage, InformationMessage};
 use crate::util::*;
 use actix::prelude::*;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::io;
 use std::mem::replace;
@@ -13,28 +13,32 @@ use tokio::net::UdpFramed;
 use tokio::prelude::stream::SplitSink;
 use tokio::prelude::Sink;
 
-pub struct Bucket<K: FindNodeCount, C: ConcurrenceCount> {
+use crate::storage::*;
+
+pub struct Bucket<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> {
     own_index: usize,
-    own_id: Key,
-    controller: Addr<Controller<K, C>>,
+    own_id: KademliaKey,
+    controller: Addr<Controller<K, C, S>>,
     //bucket_index: usize,
     bucket_size: usize,
     bucket: Vec<Connection>,
     queue: Vec<Connection>,
     ping_timeout: Duration,
-    ping_timeout_handles: HashMap<Key, SpawnHandle>,
+    ping_timeout_handles: HashMap<KademliaKey, SpawnHandle>,
     // write part of the udp stream wrapped so that Messages are deserialized automatically
-    framed_write_stream: SplitSink<UdpFramed<PeerCodec<K>>>,
+    framed_write_stream: SplitSink<UdpFramed<PeerCodec<K, S>>>,
+    storage_address: Addr<S>,
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount> Bucket<K, C> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Bucket<K, C, S> {
     pub fn new(
         own_index: usize,
-        own_id: Key,
-        controller: Addr<Controller<K, C>>,
+        own_id: KademliaKey,
+        controller: Addr<Controller<K, C, S>>,
         bucket_size: usize,
         ping_timeout: Duration,
-        framed_write_stream: SplitSink<UdpFramed<PeerCodec<K>>>,
+        framed_write_stream: SplitSink<UdpFramed<PeerCodec<K, S>>>,
+        storage_address: Addr<S>,
     ) -> Self {
         Bucket {
             own_index,
@@ -46,10 +50,11 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Bucket<K, C> {
             ping_timeout,
             ping_timeout_handles: HashMap::new(),
             framed_write_stream,
+            storage_address,
         }
     }
 
-    fn got_contact(&mut self, ctx: &mut Context<Bucket<K, C>>, peer: Connection) {
+    fn got_contact(&mut self, ctx: &mut Context<Bucket<K, C, S>>, peer: Connection) {
         if let Some((i, _)) = self.bucket.iter().enumerate().find(|(_, c)| &peer == *c) {
             let d = self.bucket.remove(i);
             self.bucket.push(d);
@@ -66,7 +71,7 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Bucket<K, C> {
                 error!("Sink error: {}, stopping actor!", err);
                 ctx.stop();
             } else {
-                self.ping_timeout_handles.insert(old_best_peer.id, ctx.run_later(self.ping_timeout, move |act: &mut Bucket<K, C>, &mut _| {
+                self.ping_timeout_handles.insert(old_best_peer.id, ctx.run_later(self.ping_timeout, move |act: &mut Bucket<K, C, S>, &mut _| {
                     if let Some(index) = act.bucket.iter().position(|p| p.id == old_best_peer.id) {
                         // TODO remove and insert same place
                         if let Some(new_peer) = act.queue.pop() {
@@ -97,7 +102,7 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Bucket<K, C> {
     fn send_with_err_handling(
         &mut self,
         peer: Connection,
-        msg: PeerMessage<K>,
+        msg: PeerMessage<K, S>,
         ctx: &mut Context<Self>,
     ) {
         if let Err(err) = (&mut self.framed_write_stream)
@@ -109,7 +114,7 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Bucket<K, C> {
         }
     }
 
-    fn send_to_controller(&mut self, msg: ControlMessage, ctx: &mut Context<Self>) {
+    fn send_to_controller(&mut self, msg: ControlMessage<S>, ctx: &mut Context<Self>) {
         if let Err(err) = self.controller.try_send(msg) {
             error!("Controller error: {}, stopping actor!", err);
             ctx.stop();
@@ -117,7 +122,7 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Bucket<K, C> {
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount> Actor for Bucket<K, C> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Actor for Bucket<K, C, S> {
     type Context = actix::Context<Self>;
 
     fn started(&mut self, _: &mut Self::Context) {
@@ -131,21 +136,24 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Actor for Bucket<K, C> {
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControlMessage> for Bucket<K, C> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMessage<S>>
+    for Bucket<K, C, S>
+{
     type Result = ();
 
-    fn handle(&mut self, msg: ControlMessage, ctx: &mut Self::Context) {
-        println!(
-            "Bucket {} got message control message {:?}",
-            self.own_index, msg
-        );
+    fn handle(&mut self, msg: ControlMessage<S>, ctx: &mut Self::Context) {
+        // println!(
+        //     "Bucket {} got message control message {:?}",
+        //     self.own_index, msg
+        // );
         match msg {
-            ControlMessage::FindNode(conn, key) => {
+            ControlMessage::FindNode(conn, key, find_data) => {
                 self.send_with_err_handling(
                     conn,
                     PeerMessage::FindNode {
                         id: key,
                         sender_id: self.own_id,
+                        find_data,
                     },
                     ctx,
                 );
@@ -173,7 +181,19 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControlMessage> for Bucket<K
                     ctx,
                 );
             }
+            ControlMessage::StoreKey(peer, key, data) => {
+                self.send_with_err_handling(
+                    peer,
+                    PeerMessage::StoreKey {
+                        sender_id: self.own_id,
+                        key,
+                        data,
+                    },
+                    ctx,
+                );
+            }
             ControlMessage::Shutdown => {
+                // TODO inform others
                 info!("Got shutdown message, stopping...!");
                 ctx.stop();
             }
@@ -182,13 +202,14 @@ impl<K: FindNodeCount, C: ConcurrenceCount> Handler<ControlMessage> for Bucket<K
     }
 }
 
-impl<K, C> StreamHandler<(PeerMessage<K>, SocketAddr), io::Error> for Bucket<K, C>
+impl<K, C, S> StreamHandler<(PeerMessage<K, S>, SocketAddr), io::Error> for Bucket<K, C, S>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
+    S: StorageActor,
 {
-    fn handle(&mut self, msg: (PeerMessage<K>, SocketAddr), ctx: &mut Self::Context) {
-        println!("Bucket {} got peer message {:?}", self.own_index, msg);
+    fn handle(&mut self, msg: (PeerMessage<K, S>, SocketAddr), ctx: &mut Self::Context) {
+        info!("Bucket {} got peer message {:?}", self.own_index, msg);
         // Got pong from peer, so we don't replace it with the first peer in the cache.
         match msg {
             (PeerMessage::Pong(id), _) => {
@@ -196,15 +217,57 @@ where
                     ctx.cancel_future(handle);
                 }
             }
-            (PeerMessage::FindNode { sender_id, id }, sender_addr) => {
+            (
+                PeerMessage::FindNode {
+                    sender_id,
+                    id,
+                    find_data,
+                },
+                sender_addr,
+            ) => {
                 let conn = Connection::new(sender_addr, sender_id);
-                // let mut nodes = (&self.bucket).to_vec();
-                // nodes.truncate(K::to_usize());
-                // TODO: Blocking ok here? Error handling?
-                // if let Err(err) = (&mut self.framed_write_stream)
-                //     .send((PeerMessage::FoundNodes(nodes), sender_addr))
-                //     .wait()
-                self.send_to_controller(ControlMessage::FindNode(conn, id), ctx);
+                if find_data {
+                    ctx.spawn(
+                        self.storage_address
+                            .send(StorageMessage::Retrieve(id))
+                            .into_actor(self)
+                            .then(move |res, act, inner_ctx| {
+                                match res {
+                                    Ok(res) => match res {
+                                        StorageResult::Found(data) => act.send_with_err_handling(
+                                            conn,
+                                            PeerMessage::FoundKey {
+                                                sender_id: act.own_id,
+                                                id,
+                                                data,
+                                            },
+                                            inner_ctx,
+                                        ),
+                                        StorageResult::NotFound => {
+                                            act.send_to_controller(
+                                                ControlMessage::FindNode(conn, id, false),
+                                                inner_ctx,
+                                            );
+                                        }
+                                    },
+                                    // something is wrong with chat server
+                                    _ => {
+                                        error!("Could not get storage result, shutting down!");
+                                        inner_ctx.stop()
+                                    }
+                                }
+                                actix::fut::ok(())
+                            }),
+                    );
+                } else {
+                    // let mut nodes = (&self.bucket).to_vec();
+                    // nodes.truncate(K::to_usize());
+                    // TODO: Blocking ok here? Error handling?
+                    // if let Err(err) = (&mut self.framed_write_stream)
+                    //     .send((PeerMessage::FoundNodes(nodes), sender_addr))
+                    //     .wait()
+                    self.send_to_controller(ControlMessage::FindNode(conn, id, false), ctx);
+                }
                 self.got_contact(ctx, conn);
             }
             (
@@ -219,9 +282,45 @@ where
                 self.send_to_controller(ControlMessage::FoundNodes(sender, id, nodes), ctx);
                 self.got_contact(ctx, sender);
             }
+            (
+                PeerMessage::FoundKey {
+                    sender_id,
+                    id,
+                    data,
+                },
+                sender_addr,
+            ) => {
+                let sender = Connection::new(sender_addr, sender_id);
+                self.send_to_controller(ControlMessage::FoundKey(sender, id, data), ctx);
+                self.got_contact(ctx, sender);
+            }
+            (
+                PeerMessage::StoreKey {
+                    sender_id,
+                    key,
+                    data,
+                },
+                sender_addr,
+            ) => {
+                let sender = Connection::new(sender_addr, sender_id);
+                // TODO ERROR Handling!
+                self.storage_address
+                    .do_send(StorageMessage::Store(key, data));
+                // .into_actor(self).then(move |res, act, inner_ctx| {
+                //     match res {
+                //         Ok(r) => act.send_with_err_handling(sender, PeerMessage::StoreKeyAnswer{sender_id: act.own_id, key, answer: r}, inner_ctx),
+                //         Err(err) => {
+                //             error!("Storage error: {}, stopping actor!", err);
+                //             inner_ctx.stop();
+                //         }
+                //     };
+                //     actix::fut::ok(())
+                // }));
+                self.got_contact(ctx, sender);
+            }
             //PeerMessage::FoundNodes(nodes) => {}
             // TODO: better error handling
-            _ => unimplemented!(),
+            msg => warn!("Unrecognized peer message: {:?}", msg),
         }
     }
 }
