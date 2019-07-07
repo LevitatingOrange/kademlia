@@ -2,9 +2,10 @@ use crate::bucket::Bucket;
 use crate::codec::PeerCodec;
 use crate::storage::*;
 use crate::util::*;
+use actix::dev::ToEnvelope;
 use actix::prelude::*;
 use generic_array::GenericArray;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::iter::FromIterator;
@@ -13,12 +14,21 @@ use std::time::Duration;
 use tokio::net::{UdpFramed, UdpSocket};
 use tokio::prelude::Stream;
 
-//pub trait MainActor = 'static + Actor<Context: ToEnvelope<Self, ControllerMessage>> + Handler<ControllerMessage>;
+pub trait MainActor<S: StorageActor> = 'static
+    + Actor<Context: ToEnvelope<Self, ControllerResponse<S>>>
+    + Handler<ControllerResponse<S>>;
 
 #[derive(Debug, Message)]
 pub enum ControllerMessage<S: StorageActor> {
     StoreKey(KademliaKey, S::StorageData),
     Retrieve(KademliaKey),
+    Shutdown,
+}
+#[derive(Debug, Message)]
+pub enum ControllerResponse<S: StorageActor> {
+    Found(KademliaKey, S::StorageData),
+    NotFound(KademliaKey),
+    Shutdown
 }
 
 // pub enum GeneratorMessage {
@@ -44,7 +54,7 @@ pub enum InformationMessage {
     ChangedBucket(usize, Vec<Connection>),
 }
 
-pub fn create_controller<K, C, S>(
+pub fn create_controller<K, C, S, M>(
     id: KademliaKey,
     first_peer_id: KademliaKey,
     base_addr: SocketAddr,
@@ -53,12 +63,13 @@ pub fn create_controller<K, C, S>(
     ping_timeout: Duration,
     find_timeout: Duration,
     storage_address: Addr<S>,
-) -> Addr<Controller<K, C, S>>
+    main_address: Option<Addr<M>>,
+) -> Addr<Controller<K, C, S, M>>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
     S: StorageActor,
-    //D: Handler<KademliaKeyMessage, Result=KademliaKey>,
+    M: MainActor<S>, //D: Handler<KademliaKeyMessage, Result=KademliaKey>,
 {
     Controller::create(move |_| {
         Controller::new(
@@ -69,13 +80,14 @@ where
             ping_timeout,
             find_timeout,
             storage_address,
+            main_address,
         )
     })
 }
 
-pub struct Controller<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> {
+pub struct Controller<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>> {
     id: KademliaKey,
-    bucket_addresses: Option<GenericArray<Addr<Bucket<K, C, S>>, BucketListSize>>,
+    bucket_addresses: Option<GenericArray<Addr<Bucket<K, C, S, M>>, BucketListSize>>,
     buckets: GenericArray<Vec<Connection>, BucketListSize>,
     base_addr: SocketAddr,
     first_peer: Connection,
@@ -85,16 +97,18 @@ pub struct Controller<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> {
     find_timeout_handles: HashMap<KademliaKey, SpawnHandle>,
     find_list: Vec<OrderedConnection>,
     storage_address: Addr<S>,
+    main_address: Option<Addr<M>>,
     k_nearest_callback: Option<Box<dyn FnOnce(&mut Self, &mut Context<Self>)>>,
     find_data: bool,
     find_active: bool,
 }
 
-impl<K, C, S> Controller<K, C, S>
+impl<K, C, S, M> Controller<K, C, S, M>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
     S: StorageActor,
+    M: MainActor<S>,
 {
     fn new(
         id: KademliaKey,
@@ -104,6 +118,7 @@ where
         ping_timeout: Duration,
         find_timeout: Duration,
         storage_address: Addr<S>,
+        main_address: Option<Addr<M>>,
     ) -> Self {
         let new_port = first_peer.address.port() + id.bucket_index(&first_peer.id) as u16;
         first_peer.address.set_port(new_port);
@@ -121,6 +136,7 @@ where
             find_timeout_handles: HashMap::new(),
             find_list: Vec::with_capacity(K::to_usize()),
             storage_address,
+            main_address,
             k_nearest_callback: None,
             find_data: false,
             find_active: false,
@@ -216,7 +232,19 @@ where
                 self.find_list.truncate(0);
                 self.find_timeout_handles.clear();
                 if self.find_data {
-                    println!("No data found for key \"{}\"", id);
+                    if let Some(addr) = &self.main_address {
+                        if let Err(err) = addr.try_send(ControllerResponse::NotFound(id)) {
+                            error!("Error talking with main actor, shutting down: {}", err);
+                            ctx.stop();
+                        }
+                    } else {
+                        warn!(
+                            "No main actor connected, NotFound message for key {} is lost",
+                            id
+                        );
+                    }
+
+                //println!("No data found for key \"{}\"", id);
                 // TODO send no key found here
                 } else {
                     info!("Search done: {:?}", self.find_list);
@@ -241,7 +269,7 @@ where
         self.find_list = nodes;
         for d in self.find_list.iter().take(C::to_usize()) {
             let conn = Connection::from(*d);
-            self.send_message(conn, ControlMessage::FindNode(conn, id, false));
+            self.send_message(conn, ControlMessage::FindNode(conn, id, self.find_data));
         }
     }
 
@@ -258,9 +286,10 @@ where
         if let Ok(i) = self.find_list.binary_search(&self.to_ord(&conn)) {
             self.find_list[i].visited = true;
             self.find_list[i].visiting = false;
-        } else {
-            error!("Could not find sending node in find list. This is a bug!");
-        }
+        } 
+        // else {
+        //     error!("Could not find sending node in find list. This is a bug!");
+        // }
 
         // put new found nodes in our list and correct their ports (each port corresponds to a bucket)
         for new_node in nodes {
@@ -287,11 +316,12 @@ where
     }
 }
 
-impl<K, C, S> Actor for Controller<K, C, S>
+impl<K, C, S, M> Actor for Controller<K, C, S, M>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
     S: StorageActor,
+    M: MainActor<S>,
 {
     type Context = actix::Context<Self>;
 
@@ -333,12 +363,19 @@ where
                 addr.do_send(ControlMessage::Shutdown);
             }
         }
+        if let Some(m) = &self.main_address {
+            // Main is still running, let it do the shutdown
+            m.do_send(ControllerResponse::Shutdown);
+        } else {
+            // We are the main actor here, shut the system down
+            System::current().stop();
+        }
         Running::Stop
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMessage<S>>
-    for Controller<K, C, S>
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>>
+    Handler<ControlMessage<S>> for Controller<K, C, S, M>
 {
     type Result = ();
 
@@ -384,10 +421,19 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMess
                 self.find_timeout_handles.clear();
                 self.find_active = false;
                 self.find_list.truncate(0);
-                println!(
+                info!(
                     "Got data with id \"{}\" from peer (\"{}\"): \"{:?}\"",
                     id, conn, data
                 );
+
+                if let Some(addr) = &self.main_address {
+                    if let Err(err) = addr.try_send(ControllerResponse::Found(id, data)) {
+                        error!("Error talking with main actor, shutting down: {}", err);
+                        ctx.stop();
+                    }
+                } else {
+                    warn!("No main actor connected, found message for key {} with returned value {:?} is lost", id, data);
+                }
                 //self.reorder_find_list(ctx, conn, nodes);
                 //self.send_find_to_next(ctx, id);
 
@@ -401,8 +447,8 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMess
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<InformationMessage>
-    for Controller<K, C, S>
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>>
+    Handler<InformationMessage> for Controller<K, C, S, M>
 {
     type Result = ();
 
@@ -416,28 +462,29 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<Information
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControllerMessage<S>>
-    for Controller<K, C, S>
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>>
+    Handler<ControllerMessage<S>> for Controller<K, C, S, M>
 {
     type Result = ();
-    fn handle(&mut self, msg: ControllerMessage<S>, _: &mut Self::Context) {
+    fn handle(&mut self, msg: ControllerMessage<S>, ctx: &mut Self::Context) {
         info!("Controller got controller message: {:?}", msg);
         match msg {
             ControllerMessage::StoreKey(id, data) => {
                 self.k_nearest_callback = Some(Box::new(move |act, _| {
-                    info!("Sending Store Request for key \"{}\" to found peers...", id);
+                    info!("Sending Store Request for key \"{}\" to {:?} found peers...", id, act.find_list.len());
                     for conn in &act.find_list {
                         let c = Connection::from(conn.clone());
                         act.send_message(c, ControlMessage::StoreKey(c, id, data.clone()));
                     }
                 }));
                 self.find_nodes(id);
-            }
+            },
             ControllerMessage::Retrieve(id) => {
                 self.find_data(id);
-            } // m => {
-              //     error!("Unrecognized controller message: {:?}", m);
-              // }
+            }, 
+            ControllerMessage::Shutdown => {
+                ctx.stop();
+            }
         }
     }
 }

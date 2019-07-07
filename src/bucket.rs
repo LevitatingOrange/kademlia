@@ -1,6 +1,6 @@
 use crate::codec::{PeerCodec, PeerMessage};
 use crate::controller::Controller;
-use crate::controller::{ControlMessage, InformationMessage};
+use crate::controller::{ControlMessage, InformationMessage, MainActor};
 use crate::util::*;
 use actix::prelude::*;
 use log::{error, info, warn};
@@ -15,10 +15,10 @@ use tokio::prelude::Sink;
 
 use crate::storage::*;
 
-pub struct Bucket<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> {
+pub struct Bucket<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>> {
     own_index: usize,
     own_id: KademliaKey,
-    controller: Addr<Controller<K, C, S>>,
+    controller: Addr<Controller<K, C, S, M>>,
     //bucket_index: usize,
     bucket_size: usize,
     bucket: Vec<Connection>,
@@ -30,11 +30,11 @@ pub struct Bucket<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> {
     storage_address: Addr<S>,
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Bucket<K, C, S> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>> Bucket<K, C, S, M> {
     pub fn new(
         own_index: usize,
         own_id: KademliaKey,
-        controller: Addr<Controller<K, C, S>>,
+        controller: Addr<Controller<K, C, S, M>>,
         bucket_size: usize,
         ping_timeout: Duration,
         framed_write_stream: SplitSink<UdpFramed<PeerCodec<K, S>>>,
@@ -54,7 +54,7 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Bucket<K, C, S> {
         }
     }
 
-    fn got_contact(&mut self, ctx: &mut Context<Bucket<K, C, S>>, peer: Connection) {
+    fn got_contact(&mut self, ctx: &mut Context<Bucket<K, C, S, M>>, peer: Connection) {
         if let Some((i, _)) = self.bucket.iter().enumerate().find(|(_, c)| &peer == *c) {
             let d = self.bucket.remove(i);
             self.bucket.push(d);
@@ -71,7 +71,7 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Bucket<K, C, S> {
                 error!("Sink error: {}, stopping actor!", err);
                 ctx.stop();
             } else {
-                self.ping_timeout_handles.insert(old_best_peer.id, ctx.run_later(self.ping_timeout, move |act: &mut Bucket<K, C, S>, &mut _| {
+                self.ping_timeout_handles.insert(old_best_peer.id, ctx.run_later(self.ping_timeout, move |act: &mut Bucket<K, C, S, M>, &mut _| {
                     if let Some(index) = act.bucket.iter().position(|p| p.id == old_best_peer.id) {
                         // TODO remove and insert same place
                         if let Some(new_peer) = act.queue.pop() {
@@ -122,11 +122,14 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Bucket<K, C, S> {
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Actor for Bucket<K, C, S> {
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>> Actor
+    for Bucket<K, C, S, M>
+{
     type Context = actix::Context<Self>;
 
-    fn started(&mut self, _: &mut Self::Context) {
-        // TODO
+    fn started(&mut self, ctx: &mut Self::Context) {
+        // set mailbox size so store requests get through
+        ctx.set_mailbox_capacity(K::to_usize() + 10);
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
@@ -136,16 +139,16 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Actor for Bucket<K,
     }
 }
 
-impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMessage<S>>
-    for Bucket<K, C, S>
+impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor, M: MainActor<S>>
+    Handler<ControlMessage<S>> for Bucket<K, C, S, M>
 {
     type Result = ();
 
     fn handle(&mut self, msg: ControlMessage<S>, ctx: &mut Self::Context) {
-        // println!(
-        //     "Bucket {} got message control message {:?}",
-        //     self.own_index, msg
-        // );
+        info!(
+            "Bucket {} got message control message {:?}",
+            self.own_index, msg
+        );
         match msg {
             ControlMessage::FindNode(conn, key, find_data) => {
                 self.send_with_err_handling(
@@ -202,16 +205,22 @@ impl<K: FindNodeCount, C: ConcurrenceCount, S: StorageActor> Handler<ControlMess
     }
 }
 
-impl<K, C, S> StreamHandler<(PeerMessage<K, S>, SocketAddr), io::Error> for Bucket<K, C, S>
+impl<K, C, S, M> StreamHandler<(PeerMessage<K, S>, SocketAddr), io::Error> for Bucket<K, C, S, M>
 where
     K: FindNodeCount,
     C: ConcurrenceCount,
     S: StorageActor,
+    M: MainActor<S>,
 {
     fn handle(&mut self, msg: (PeerMessage<K, S>, SocketAddr), ctx: &mut Self::Context) {
         info!("Bucket {} got peer message {:?}", self.own_index, msg);
         // Got pong from peer, so we don't replace it with the first peer in the cache.
         match msg {
+            (PeerMessage::Ping, conn) => {
+                // TODO remove connection from send_with_err_handling
+                let peer = Connection::new(conn, KademliaKey(0));
+                self.send_with_err_handling(peer, PeerMessage::Pong(self.own_id), ctx);
+            },
             (PeerMessage::Pong(id), _) => {
                 if let Some(handle) = self.ping_timeout_handles.remove(&id) {
                     ctx.cancel_future(handle);

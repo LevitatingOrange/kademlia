@@ -8,9 +8,9 @@ mod controller;
 mod storage;
 mod util;
 
-pub use controller::{create_controller, Controller, ControllerMessage};
+pub use controller::{create_controller, Controller, ControllerMessage, ControllerResponse, MainActor};
 pub use storage::*;
-pub use util::KademliaKey;
+pub use util::{ConcurrenceCount, FindNodeCount, KademliaKey};
 
 // #[cfg(test)]
 // mod tests {
